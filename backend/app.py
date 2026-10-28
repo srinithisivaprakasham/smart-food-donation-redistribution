@@ -127,6 +127,150 @@ def validate_request_priority_schedule(priority, required_date, required_time):
     return ''
 
 
+def availability_schedule(date_value, time_value=None):
+    date_string = str(date_value or '').strip()
+    time_string = str(time_value or '').strip()
+    if 'T' in date_string:
+        date_string, embedded_time = date_string.split('T', 1)
+        if not time_string:
+            time_string = embedded_time[:5]
+    return date_string[:10], time_string[:5]
+
+
+def availability_time_minutes(value):
+    time_string = str(value or '').strip()
+    if not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d', time_string):
+        raise ValueError('Availability times must use HH:MM format.')
+    parsed = datetime.strptime(time_string, '%H:%M')
+    return parsed.hour * 60 + parsed.minute
+
+
+def volunteer_available_for_window(data, volunteer_id, date_value, time_value=None):
+    date_string, time_string = availability_schedule(date_value, time_value)
+    if not date_string:
+        return True
+    try:
+        datetime.strptime(date_string, '%Y-%m-%d')
+    except ValueError:
+        return False
+
+    entries = [
+        entry for entry in data.get('volunteer_availability', [])
+        if entry.get('volunteer_id') == volunteer_id and entry.get('date') == date_string
+    ]
+    if not entries:
+        return True
+
+    def is_legacy_entry(entry):
+        return not entry.get('start_time') and not entry.get('end_time')
+
+    if any(entry.get('status') == 'unavailable' and is_legacy_entry(entry) for entry in entries):
+        return False
+    if not time_string and any(not is_legacy_entry(entry) for entry in entries):
+        return False
+
+    time_minutes = None
+    if time_string:
+        try:
+            time_minutes = availability_time_minutes(time_string)
+        except ValueError:
+            return False
+
+    for entry in entries:
+        if entry.get('status') != 'unavailable' or is_legacy_entry(entry):
+            continue
+        try:
+            start = availability_time_minutes(entry.get('start_time'))
+            end = availability_time_minutes(entry.get('end_time'))
+        except ValueError:
+            return False
+        if time_minutes is None or start <= time_minutes < end:
+            return False
+
+    available_entries = [entry for entry in entries if entry.get('status') == 'available']
+    if not available_entries:
+        return True
+    for entry in available_entries:
+        if is_legacy_entry(entry):
+            return True
+        try:
+            start = availability_time_minutes(entry.get('start_time'))
+            end = availability_time_minutes(entry.get('end_time'))
+        except ValueError:
+            continue
+        if time_minutes is not None and start <= time_minutes < end:
+            return True
+    return False
+
+
+def delivery_task_schedule(data, task):
+    date_value = task.get('scheduled_date') or task.get('required_date') or task.get('due_date') or task.get('date')
+    time_value = task.get('scheduled_time') or task.get('required_time') or task.get('due_time')
+    scheduled_at = task.get('scheduled_at')
+    if scheduled_at and not date_value:
+        date_value = scheduled_at
+
+    request_item = next(
+        (item for item in data.get('donation_requests', []) if item.get('id') == task.get('request_id')),
+        None,
+    )
+    request_contribution = next(
+        (item for item in data.get('request_contributions', []) if item.get('id') == task.get('request_contribution_id')),
+        None,
+    )
+    if not request_item and request_contribution:
+        request_item = next(
+            (item for item in data.get('donation_requests', []) if item.get('id') == request_contribution.get('request_id')),
+            None,
+        )
+    if request_item:
+        date_value = date_value or request_item.get('required_date')
+        time_value = time_value or request_item.get('required_time')
+
+    need = next(
+        (item for item in data.get('community_needs', []) if item.get('id') == task.get('community_need_id')),
+        None,
+    )
+    if need:
+        date_value = date_value or need.get('required_date')
+        time_value = time_value or need.get('required_time')
+
+    return availability_schedule(date_value, time_value)
+
+
+def delivery_task_relevant_date(data, task):
+    if task.get('status') == 'delivered':
+        completed_at = task.get('delivered_at') or task.get('completed_at')
+        if completed_at:
+            return completed_at
+        delivered_transition = next(
+            (
+                item for item in reversed(task.get('status_history', []))
+                if item.get('status') == 'delivered' and item.get('created_at')
+            ),
+            None,
+        )
+        return delivered_transition.get('created_at') if delivered_transition else None
+
+    scheduled_at = task.get('scheduled_at')
+    if scheduled_at:
+        return scheduled_at
+    scheduled_date, _ = delivery_task_schedule(data, task)
+    if scheduled_date:
+        return scheduled_date
+
+    assigned_transition = next(
+        (
+            item for item in task.get('status_history', [])
+            if item.get('status') == 'assigned' and item.get('created_at')
+        ),
+        None,
+    )
+    if assigned_transition:
+        return assigned_transition.get('created_at')
+    return task.get('assigned_at')
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
@@ -448,12 +592,41 @@ def delivery_task_donation_id(data, task):
     return contribution.get('donation_id') if contribution else None
 
 
+def delivery_task_request_id(data, task):
+    if task.get('request_id'):
+        return task['request_id']
+    contribution = next(
+        (
+            item for item in data.get('request_contributions', [])
+            if item.get('id') == task.get('request_contribution_id')
+        ),
+        None,
+    )
+    return contribution.get('request_id') if contribution else None
+
+
+def delivery_issue_matches_task(data, issue, task):
+    issue_delivery_ids = {
+        value for value in (issue.get('task_id'), issue.get('delivery_id')) if value
+    }
+    if len(issue_delivery_ids) != 1 or task.get('id') not in issue_delivery_ids:
+        return False
+
+    issue_request_id = issue.get('request_id')
+    task_request_id = delivery_task_request_id(data, task)
+    if not issue_request_id or not task_request_id or issue_request_id != task_request_id:
+        return False
+    return True
+
+
 def delivery_issue_context(data, issue):
     task_id = issue.get('task_id') or issue.get('delivery_id')
     task = next(
         (item for item in data.get('delivery_tasks', []) if item.get('id') == task_id),
         None,
     )
+    if task and not delivery_issue_matches_task(data, issue, task):
+        task = None
     request_id = issue.get('request_id') or (task.get('request_id') if task else None)
     if not request_id and task and task.get('request_contribution_id'):
         contribution = next(
@@ -478,7 +651,59 @@ def delivery_issue_context(data, issue):
     return task, request_item, donation
 
 
-def delivery_issue_visible_to_user(user, issue, task, request_item, donation):
+def delivery_issue_donation(data, issue, task, request_item):
+    if not task:
+        return None
+
+    task_request_id = delivery_task_request_id(data, task)
+    if (
+        not task_request_id
+        or not request_item
+        or request_item.get('id') != task_request_id
+        or issue.get('request_id') != task_request_id
+    ):
+        return None
+
+    contribution_id = task.get('request_contribution_id')
+    if contribution_id:
+        contribution = next(
+            (
+                item for item in data.get('request_contributions', [])
+                if item.get('id') == contribution_id
+            ),
+            None,
+        )
+        if not contribution or contribution.get('request_id') != task_request_id:
+            return None
+        donation_id = contribution.get('donation_id')
+        if task.get('donation_id') and task.get('donation_id') != donation_id:
+            return None
+        if (
+            not request_item.get('multi_contribution')
+            and request_item.get('donation_id')
+            and request_item.get('donation_id') != donation_id
+        ):
+            return None
+    else:
+        task_donation_id = task.get('donation_id')
+        request_donation_id = request_item.get('donation_id')
+        if (
+            task_donation_id
+            and request_donation_id
+            and task_donation_id != request_donation_id
+        ):
+            return None
+        donation_id = task_donation_id or request_donation_id
+
+    if not donation_id or (issue.get('donation_id') and issue.get('donation_id') != donation_id):
+        return None
+    return next(
+        (item for item in data.get('donations', []) if item.get('id') == donation_id),
+        None,
+    )
+
+
+def delivery_issue_visible_to_user(user, issue, task, request_item, data):
     role = user.get('role')
     user_id = user.get('id')
     if role == 'admin':
@@ -493,7 +718,8 @@ def delivery_issue_visible_to_user(user, issue, task, request_item, donation):
     if role == 'ngo':
         return bool(task and task.get('ngo_id') == user_id)
     if role == 'donor':
-        return bool(donation and donation.get('donor_id') == user_id)
+        verified_donation = delivery_issue_donation(data, issue, task, request_item)
+        return bool(verified_donation and verified_donation.get('donor_id') == user_id)
     if role == 'volunteer':
         return bool(task and task.get('volunteer_id') == user_id)
     return False
@@ -2526,9 +2752,6 @@ def list_requests():
     feedback_by_task = {}
     for item in data.get('delivery_feedback', []):
         feedback_by_task.setdefault(item.get('task_id'), []).append(item)
-    issues_by_task = {}
-    for item in data.get('delivery_issues', []):
-        issues_by_task.setdefault(item.get('task_id'), []).append(item)
     for request_item in requests_list:
         donation = donations_by_id.get(request_item.get('donation_id'))
         request_item['multi_contribution'] = bool(
@@ -2677,7 +2900,8 @@ def list_requests():
                     if user.get('role') == 'ngo' or entry.get('author_id') == user.get('id')
                 ]
                 visible_issues = [
-                    entry for entry in issues_by_task.get(task.get('id'), [])
+                    entry for entry in data.get('delivery_issues', [])
+                    if delivery_issue_matches_task(data, entry, task)
                     if user.get('role') == 'ngo' or entry.get('receiver_id') == user.get('id')
                 ]
                 request_item['delivery_tasks'].append({
@@ -2976,14 +3200,16 @@ def assign_request_contribution(request_id, contribution_id):
         for item in data.get('delivery_tasks', [])
     ):
         return jsonify({'error': 'This volunteer already has an active delivery.'}), 409
-    today = datetime.now(timezone.utc).date().isoformat()
-    if any(
-        item.get('volunteer_id') == volunteer_id
-        and item.get('date') == today
-        and item.get('status') == 'unavailable'
-        for item in data.get('volunteer_availability', [])
-    ):
-        return jsonify({'error': 'This volunteer has marked themselves unavailable today.'}), 409
+    scheduled_date, scheduled_time = availability_schedule(
+        request_item.get('required_date'),
+        request_item.get('required_time'),
+    )
+    if not scheduled_date:
+        now = datetime.now().astimezone()
+        scheduled_date = now.date().isoformat()
+        scheduled_time = now.strftime('%H:%M')
+    if not volunteer_available_for_window(data, volunteer_id, scheduled_date, scheduled_time):
+        return jsonify({'error': 'This volunteer is not available for the request’s scheduled date and time.'}), 409
 
     assigned_at = utc_now()
     task = {
@@ -3266,10 +3492,14 @@ def list_delivery_tasks():
     feedback_by_task = {}
     for feedback in data.get('delivery_feedback', []):
         feedback_by_task.setdefault(feedback.get('task_id'), []).append(feedback)
-    issues_by_task = {}
+    issues_by_delivery = {}
     for issue in data.get('delivery_issues', []):
-        issues_by_task.setdefault(issue.get('task_id'), []).append(issue)
+        for issue_delivery_id in {
+            value for value in (issue.get('task_id'), issue.get('delivery_id')) if value
+        }:
+            issues_by_delivery.setdefault(issue_delivery_id, []).append(issue)
     for task in tasks:
+        task['relevant_delivery_date'] = delivery_task_relevant_date(data, task)
         volunteer = profiles_by_id.get(task.get('volunteer_id'))
         task['volunteer_name'] = volunteer.get('full_name', '') if volunteer else ''
         donation = donations_by_id.get(task.get('donation_id'))
@@ -3309,7 +3539,13 @@ def list_delivery_tasks():
             else 'servings' if contribution else ''
         )
         task_feedback = feedback_by_task.get(task.get('id'), [])
-        task_issues = issues_by_task.get(task.get('id'), [])
+        task_request_id = delivery_task_request_id(data, task)
+        if task_request_id:
+            task['request_id'] = task_request_id
+        task_issues = [
+            issue for issue in issues_by_delivery.get(task.get('id'), [])
+            if delivery_issue_matches_task(data, issue, task)
+        ]
         if user.get('role') in {'volunteer', 'ngo'}:
             task_feedback = [
                 {key: value for key, value in item.items() if key not in {'author_id', 'author_name', 'receiver_id'}}
@@ -3455,6 +3691,13 @@ def accept_delivery_task(task_id):
     can_accept_assigned_task = task.get('status') == 'assigned' and task.get('volunteer_id') == user['id']
     if not (can_accept_open_task or can_accept_assigned_task):
         return jsonify({'error': 'This delivery task has already been accepted.'}), 409
+    scheduled_date, scheduled_time = delivery_task_schedule(data, task)
+    if not scheduled_date:
+        now = datetime.now().astimezone()
+        scheduled_date = now.date().isoformat()
+        scheduled_time = now.strftime('%H:%M')
+    if not volunteer_available_for_window(data, user['id'], scheduled_date, scheduled_time):
+        return jsonify({'error': 'You are not available for this delivery at its scheduled date and time.'}), 409
 
     task['volunteer_id'] = user['id']
     task['volunteer_name'] = user.get('full_name', '')
@@ -4096,6 +4339,15 @@ def volunteer_availability():
         return jsonify({'error': 'Availability must be available or unavailable.'}), 400
     if len(notes) > 500:
         return jsonify({'error': 'Availability notes cannot exceed 500 characters.'}), 400
+    start_time = str(payload.get('start_time') or '').strip()
+    end_time = str(payload.get('end_time') or '').strip()
+    try:
+        start_minutes = availability_time_minutes(start_time)
+        end_minutes = availability_time_minutes(end_time)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if start_minutes >= end_minutes:
+        return jsonify({'error': 'End Time must be later than Start Time.'}), 400
 
     with DATA_SAVE_LOCK:
         data = load_auth_data()
@@ -4118,6 +4370,8 @@ def volunteer_availability():
             entries.append(entry)
         entry.update({
             'status': status,
+            'start_time': start_time,
+            'end_time': end_time,
             'notes': notes,
             'updated_at': utc_now(),
         })
@@ -4161,6 +4415,20 @@ def update_volunteer_availability(entry_id):
             return jsonify({'error': 'Availability must be available or unavailable.'}), 400
         if len(notes) > 500:
             return jsonify({'error': 'Availability notes cannot exceed 500 characters.'}), 400
+        start_time = str(payload.get('start_time', entry.get('start_time', '')) or '').strip()
+        end_time = str(payload.get('end_time', entry.get('end_time', '')) or '').strip()
+        if ('start_time' in payload or 'end_time' in payload) and (not start_time or not end_time):
+            return jsonify({'error': 'Both Start Time and End Time are required.'}), 400
+        if bool(start_time) != bool(end_time):
+            return jsonify({'error': 'Both Start Time and End Time are required.'}), 400
+        if start_time and end_time:
+            try:
+                start_minutes = availability_time_minutes(start_time)
+                end_minutes = availability_time_minutes(end_time)
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 400
+            if start_minutes >= end_minutes:
+                return jsonify({'error': 'End Time must be later than Start Time.'}), 400
 
         existing_date_entry = next(
             (
@@ -4177,6 +4445,9 @@ def update_volunteer_availability(entry_id):
                 'notes': notes,
                 'updated_at': utc_now(),
             })
+            if start_time and end_time:
+                existing_date_entry['start_time'] = start_time
+                existing_date_entry['end_time'] = end_time
             data['volunteer_availability'] = [
                 item for item in entries if item.get('id') != entry_id
             ]
@@ -4185,6 +4456,9 @@ def update_volunteer_availability(entry_id):
             entry['date'] = date_value
             entry['status'] = status
             entry['notes'] = notes
+            if start_time and end_time:
+                entry['start_time'] = start_time
+                entry['end_time'] = end_time
             entry['updated_at'] = utc_now()
         write_data_file_atomically(data)
     return jsonify({'availability': entry})
@@ -4232,7 +4506,7 @@ def delivery_task_feedback(task_id):
             visible_issues = [
                 {key: value for key, value in item.items() if key not in {'receiver_id', 'receiver_name'}}
                 for item in data.get('delivery_issues', [])
-                if item.get('task_id') == task_id
+                if delivery_issue_matches_task(data, item, task)
             ]
         elif user.get('role') == 'ngo':
             visible = [
@@ -4243,7 +4517,7 @@ def delivery_task_feedback(task_id):
             visible_issues = [
                 {key: value for key, value in item.items() if key not in {'receiver_id', 'receiver_name'}}
                 for item in data.get('delivery_issues', [])
-                if item.get('task_id') == task_id
+                if delivery_issue_matches_task(data, item, task)
             ]
         else:
             visible = [
@@ -4252,7 +4526,7 @@ def delivery_task_feedback(task_id):
             ]
             visible_issues = [
                 item for item in data.get('delivery_issues', [])
-                if item.get('task_id') == task_id
+                if delivery_issue_matches_task(data, item, task)
                 and (user.get('role') == 'ngo' or item.get('receiver_id') == user['id'])
             ]
         return jsonify({
@@ -4431,10 +4705,23 @@ def list_delivery_issues():
 
     data = load_data()
     visible_issues = []
+    seen_issue_ids = set()
     for issue in data.get('delivery_issues', []):
-        task, request_item, donation = delivery_issue_context(data, issue)
-        if delivery_issue_visible_to_user(user, issue, task, request_item, donation):
-            visible_issues.append(serialize_delivery_issue(data, issue))
+        task, request_item, _ = delivery_issue_context(data, issue)
+        if (
+            issue.get('id') not in seen_issue_ids
+            and task
+            and delivery_issue_matches_task(data, issue, task)
+            and delivery_issue_visible_to_user(user, issue, task, request_item, data)
+        ):
+            serialized_issue = serialize_delivery_issue(data, issue)
+            if user.get('role') == 'donor':
+                verified_donation = delivery_issue_donation(data, issue, task, request_item)
+                if not verified_donation:
+                    continue
+                serialized_issue['donation_id'] = verified_donation.get('id')
+            visible_issues.append(serialized_issue)
+            seen_issue_ids.add(issue.get('id'))
     visible_issues.sort(key=lambda item: item.get('created_at') or '', reverse=True)
     return jsonify({'issues': visible_issues})
 
@@ -4478,7 +4765,7 @@ def delivery_task_issues(task_id):
                 return jsonify({'error': 'An issue can only be reported after the delivery is completed.'}), 409
             issues = data.setdefault('delivery_issues', [])
             if any(
-                (item.get('task_id') or item.get('delivery_id')) == task_id
+                delivery_issue_matches_task(data, item, task)
                 and (item.get('reporter_id') or item.get('receiver_id')) == user.get('id')
                 for item in issues
             ):
@@ -4522,17 +4809,17 @@ def delivery_task_issues(task_id):
         issues = [
             {key: value for key, value in item.items() if key not in {'receiver_id', 'receiver_name'}}
             for item in data.get('delivery_issues', [])
-            if item.get('task_id') == task_id
+            if delivery_issue_matches_task(data, item, task)
         ]
     elif user.get('role') == 'ngo' and task.get('ngo_id') == user.get('id'):
         issues = [
             item for item in data.get('delivery_issues', [])
-            if item.get('task_id') == task_id
+            if delivery_issue_matches_task(data, item, task)
         ]
     elif user.get('role') == 'requester' and request_item and request_item.get('requester_id', request_item.get('ngo_id')) == user.get('id'):
         issues = [
             item for item in data.get('delivery_issues', [])
-            if (item.get('task_id') or item.get('delivery_id')) == task_id
+            if delivery_issue_matches_task(data, item, task)
             and (item.get('reporter_id') or item.get('receiver_id')) == user.get('id')
         ]
     elif user.get('role') == 'donor':
@@ -4545,7 +4832,7 @@ def delivery_task_issues(task_id):
             return jsonify({'error': 'You are not authorized to view issues for this delivery.'}), 403
         issues = [
             item for item in data.get('delivery_issues', [])
-            if (item.get('task_id') or item.get('delivery_id')) == task_id
+            if delivery_issue_matches_task(data, item, task)
         ]
     else:
         return jsonify({'error': 'You are not authorized to view issues for this delivery.'}), 403
@@ -4570,9 +4857,9 @@ def update_delivery_issue(issue_id):
     )
     if not issue:
         return jsonify({'error': 'Delivery issue not found.'}), 404
-    task, request_item, donation = delivery_issue_context(data, issue)
+    task, request_item, _ = delivery_issue_context(data, issue)
     if request.method == 'GET':
-        if not delivery_issue_visible_to_user(user, issue, task, request_item, donation):
+        if not delivery_issue_visible_to_user(user, issue, task, request_item, data):
             return jsonify({'error': 'You are not authorized to view this delivery issue.'}), 403
         return jsonify({'issue': serialize_delivery_issue(data, issue)})
 
@@ -5123,12 +5410,8 @@ def community_need_available_volunteers():
         for task in data.get('delivery_tasks', [])
         if task.get('volunteer_id') and task.get('status') in {'assigned', 'accepted', 'picked_up', 'in_transit'}
     }
-    today = datetime.now(timezone.utc).date().isoformat()
-    unavailable_ids = {
-        entry.get('volunteer_id')
-        for entry in data.get('volunteer_availability', [])
-        if entry.get('date') == today and entry.get('status') == 'unavailable'
-    }
+    scheduled_date = request.args.get('date') or ''
+    scheduled_time = request.args.get('time') or ''
     volunteer_groups = {}
     for profile in data.get('profiles', []):
         volunteer_id = profile.get('id')
@@ -5141,7 +5424,7 @@ def community_need_available_volunteers():
     volunteers = []
     for profiles_by_id in volunteer_groups.values():
         volunteer_ids = set(profiles_by_id)
-        if volunteer_ids.intersection(active_volunteer_ids | unavailable_ids):
+        if volunteer_ids.intersection(active_volunteer_ids):
             continue
         delivered_counts = {
             volunteer_id: sum(
@@ -5158,6 +5441,13 @@ def community_need_available_volunteers():
                 volunteer_id,
             ),
         )
+        if scheduled_date and not volunteer_available_for_window(
+            data,
+            representative_id,
+            scheduled_date,
+            scheduled_time,
+        ):
+            continue
         volunteers.append(serialize_profile(profiles_by_id[representative_id]))
 
     return jsonify({'volunteers': [
@@ -5221,14 +5511,12 @@ def assign_community_need_delivery(need_id):
         for task in data.get('delivery_tasks', [])
     ):
         return jsonify({'error': 'This volunteer already has an active delivery.'}), 409
-    today = datetime.now(timezone.utc).date().isoformat()
-    if any(
-        entry.get('volunteer_id') == volunteer_id
-        and entry.get('date') == today
-        and entry.get('status') == 'unavailable'
-        for entry in data.get('volunteer_availability', [])
-    ):
-        return jsonify({'error': 'This volunteer has marked themselves unavailable today.'}), 409
+    scheduled_date, scheduled_time = availability_schedule(
+        need.get('required_date'),
+        need.get('required_time'),
+    )
+    if not volunteer_available_for_window(data, volunteer_id, scheduled_date, scheduled_time):
+        return jsonify({'error': 'This volunteer is not available for the community need’s scheduled date and time.'}), 409
 
     assigned_at = utc_now()
     task = {

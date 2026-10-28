@@ -870,11 +870,19 @@ type DeliveryTask = {
   status_history: Array<{ status: string; created_at: string }>
   created_at: string
   updated_at: string
+  relevant_delivery_date?: string | null
   cancellation_reason?: string
   cancelled_at?: string
   feedback?: FeedbackEntry[]
   issues?: DeliveryIssue[]
   receiver_name?: string
+}
+
+function deliveryIssueMatchesTask(issue: DeliveryIssue, task: Pick<DeliveryTask, 'id' | 'request_id'>): boolean {
+  const issueDeliveryIds = [issue.task_id, issue.delivery_id].filter(Boolean)
+  return issueDeliveryIds.length > 0
+    && issueDeliveryIds.every((deliveryId) => deliveryId === task.id)
+    && Boolean(issue.request_id && task.request_id && issue.request_id === task.request_id)
 }
 
 type AvailabilityEntry = {
@@ -883,6 +891,8 @@ type AvailabilityEntry = {
   volunteer_name?: string
   date: string
   status: 'available' | 'unavailable'
+  start_time?: string
+  end_time?: string
   notes?: string
 }
 
@@ -1866,6 +1876,65 @@ function isFeedbackSubmittedOnLocalDay(value: string, localDay: Date): boolean {
     && submittedAt.getDate() === localDay.getDate()
 }
 
+function isIssueReportedTodayInKolkata(createdAt: string, currentTime: Date): boolean {
+  const reportedAt = new Date(createdAt)
+  if (!Number.isFinite(reportedAt.getTime())) return false
+
+  const dateFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  return dateFormatter.format(reportedAt) === dateFormatter.format(currentTime)
+}
+
+function nextKolkataMidnight(currentTime: Date): number {
+  const dateParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+  }).formatToParts(currentTime)
+  const year = Number(dateParts.find((part) => part.type === 'year')?.value)
+  const month = Number(dateParts.find((part) => part.type === 'month')?.value)
+  const day = Number(dateParts.find((part) => part.type === 'day')?.value)
+  return Date.UTC(year, month - 1, day + 1) - (5 * 60 + 30) * 60 * 1000
+}
+
+function deliveryTaskIsOnKolkataDay(task: Pick<DeliveryTask, 'relevant_delivery_date'>, currentTime: Date): boolean {
+  const value = task.relevant_delivery_date?.trim()
+  if (!value) return false
+
+  const dateFormatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  })
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return value === dateFormatter.format(currentTime)
+  }
+
+  const deliveryDate = new Date(value)
+  return Number.isFinite(deliveryDate.getTime())
+    && dateFormatter.format(deliveryDate) === dateFormatter.format(currentTime)
+}
+
+function deliveryTaskIsOnLocalDay(task: Pick<DeliveryTask, 'relevant_delivery_date'>, localDay: Date): boolean {
+  const value = task.relevant_delivery_date?.trim()
+  if (!value) return false
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const localDate = [
+      localDay.getFullYear(),
+      String(localDay.getMonth() + 1).padStart(2, '0'),
+      String(localDay.getDate()).padStart(2, '0'),
+    ].join('-')
+    return value === localDate
+  }
+  return isFeedbackSubmittedOnLocalDay(value, localDay)
+}
+
 function donationCardStatuses(donation: PublicDonation): string[] {
   const remainingQuantity = donation.remaining_quantity ?? donation.quantity
   const expiryValue = donation.available_until
@@ -1946,6 +2015,53 @@ function formatRequestStatus(value: string): string {
 
 function localDateInputValue(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+function getScheduleWindow(dateValue?: string, timeValue?: string) {
+  const [date = '', embeddedTime = ''] = String(dateValue || '').split('T')
+  return {
+    date,
+    time: timeValue || embeddedTime.slice(0, 5),
+  }
+}
+
+function volunteerAvailableForWindow(
+  availability: AvailabilityEntry[],
+  volunteerId: string,
+  date: string,
+  time: string,
+): boolean {
+  if (!date) return true
+
+  const entries = availability.filter((entry) => entry.volunteer_id === volunteerId && entry.date === date)
+  if (!entries.length) return true
+
+  const isLegacyEntry = (entry: AvailabilityEntry) => !entry.start_time && !entry.end_time
+  const parseMinutes = (value?: string) => {
+    const match = value?.match(/^([01]\d|2[0-3]):([0-5]\d)$/)
+    return match ? Number(match[1]) * 60 + Number(match[2]) : null
+  }
+  const timeMinutes = parseMinutes(time)
+
+  if (entries.some((entry) => entry.status === 'unavailable' && isLegacyEntry(entry))) return false
+  if (!time && entries.some((entry) => !isLegacyEntry(entry))) return false
+
+  const timeIsBlocked = entries.some((entry) => {
+    if (entry.status !== 'unavailable' || isLegacyEntry(entry)) return false
+    const start = parseMinutes(entry.start_time)
+    const end = parseMinutes(entry.end_time)
+    return timeMinutes === null || start === null || end === null || (timeMinutes >= start && timeMinutes < end)
+  })
+  if (timeIsBlocked) return false
+
+  const availableEntries = entries.filter((entry) => entry.status === 'available')
+  if (!availableEntries.length) return true
+  return availableEntries.some((entry) => {
+    if (isLegacyEntry(entry)) return true
+    const start = parseMinutes(entry.start_time)
+    const end = parseMinutes(entry.end_time)
+    return timeMinutes !== null && start !== null && end !== null && timeMinutes >= start && timeMinutes < end
+  })
 }
 
 function dateTimeInputValue(value?: string): string {
@@ -2870,16 +2986,6 @@ function PublicBrowsePage({ user }: { user: SessionUser | null }) {
 
           <section id="community-updates" className="section-shell scroll-mt-5 rounded-[28px] p-5">
             <div><p className="text-sm font-semibold uppercase tracking-[0.18em] text-[#1d4d3d]">Community updates</p><h2 className="mt-1 text-2xl font-bold">Public updates and alerts</h2></div>
-            {loading ? <p className="mt-4 text-sm text-slate-600">Loading public updates…</p> : overview?.alerts.length ? (
-              <ul className="mt-5 space-y-3">
-                {overview.alerts.map((alert, index) => (
-                  <li key={`${alert.type}:${alert.created_at}:${index}`} className="flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
-                    <Bell size={18} className="mt-0.5 shrink-0 text-amber-800" />
-                    <div><p className="text-sm font-medium text-slate-900">{alert.message}</p><p className="mt-1 text-xs text-slate-600">{formatPublicDate(alert.created_at)}</p></div>
-                  </li>
-                ))}
-              </ul>
-            ) : !error ? <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">There are no current public alerts.</p> : null}
           </section>
 
           <section className="section-shell flex flex-wrap items-center justify-between gap-4 rounded-[28px] p-5">
@@ -3777,6 +3883,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
               donations={donations}
               requests={requests}
               deliveryTasks={deliveryTasks}
+              deliveryLocalDay={feedbackVisibilityDay}
               donationCancellations={donationCancellations}
               needs={needs}
               onReload={reloadDashboardData}
@@ -3790,6 +3897,7 @@ function DashboardPage({ user, onLogout, onUserUpdate }: { user: SessionUser; on
 }
 
 function DonorDashboard({ user, overview, donations, requests, needs, feedbackVisibilityDay, deliveryIssues, onReload, onDonationCreated }: { user: SessionUser; overview: DashboardSummary | null; donations: Donation[]; requests: RequestItem[]; needs: CommunityNeed[]; feedbackVisibilityDay: Date; deliveryIssues: DeliveryIssue[]; onReload: () => Promise<void>; onDonationCreated: (donation: Donation) => void }) {
+  const [issueVisibilityTime, setIssueVisibilityTime] = useState(() => new Date())
   const [message, setMessage] = useState('')
   const [editingDonationId, setEditingDonationId] = useState<string | null>(null)
   const [imageUploading, setImageUploading] = useState(false)
@@ -3816,6 +3924,13 @@ function DonorDashboard({ user, overview, donations, requests, needs, feedbackVi
   const [downloadingCertificateId, setDownloadingCertificateId] = useState('')
   const savingDonationRef = useRef(false)
   const submissionKeyRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setIssueVisibilityTime(new Date())
+    }, Math.max(0, nextKolkataMidnight(issueVisibilityTime) - issueVisibilityTime.getTime()) + 10)
+    return () => window.clearTimeout(timeoutId)
+  }, [issueVisibilityTime])
 
   useEffect(() => {
     let active = true
@@ -4297,6 +4412,8 @@ function DonorDashboard({ user, overview, donations, requests, needs, feedbackVi
     { label: 'Meals contributed', value: overview?.stats.estimated_meals ?? 0, accent: 'bg-[#fdf2f8] text-[#be185d]' },
   ]
   const earnedCertificates = milestoneCertificates
+  const uniqueDeliveryIssues = Array.from(new Map(deliveryIssues.map((issue) => [issue.id, issue])).values())
+    .filter((issue) => isIssueReportedTodayInKolkata(issue.created_at, issueVisibilityTime))
   const donorMilestones = [
     { key: 'first_donation', target: 1, label: 'First Donation' },
     { key: 'community_hero', target: 5, label: 'Community Hero' },
@@ -4321,23 +4438,28 @@ function DonorDashboard({ user, overview, donations, requests, needs, feedbackVi
         ))}
       </section>
 
-      {deliveryIssues.length > 0 && (
-        <section className="section-shell rounded-[28px] p-5">
-          <h2 className="text-xl font-bold text-slate-900">Issues linked to your donations</h2>
+      <section className="section-shell rounded-[28px] p-5">
+        <h2 className="text-xl font-bold text-slate-900">Issues linked to your donations</h2>
+        {uniqueDeliveryIssues.length > 0 ? (
           <div className="mt-4 space-y-3">
-            {deliveryIssues.map((issue) => (
+            {uniqueDeliveryIssues.map((issue) => (
               <Link key={issue.id} to={`/delivery-issues/${encodeURIComponent(issue.id)}`} className="block rounded-2xl border border-amber-200 bg-amber-50/50 p-4 hover:bg-amber-50">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <p className="font-semibold text-slate-900">{issue.category || 'Delivery'} · {formatStatus(issue.status)}</p>
                   <span className="text-xs text-slate-500">Issue {issue.id}</span>
                 </div>
                 <p className="mt-2 text-sm text-slate-700">{issue.description}</p>
+                <p className="mt-2 text-xs text-slate-500">
+                  Donation: {issue.donation_id || 'Not linked'} · Reported: {issue.created_at ? new Date(issue.created_at).toLocaleString() : 'Date not recorded'}
+                </p>
                 {issue.resolution_note && <p className="mt-2 text-sm text-slate-600">NGO response: {issue.resolution_note}</p>}
               </Link>
             ))}
           </div>
-        </section>
-      )}
+        ) : (
+          <p className="mt-3 text-sm text-slate-600">No delivery issues are linked to your donations yet.</p>
+        )}
+      </section>
 
       <section className="section-shell rounded-[28px] p-5" aria-labelledby="donor-donation-certificates-heading">
         <h3 id="donor-donation-certificates-heading" className="text-xl font-bold text-slate-900">My Donation Certificates</h3>
@@ -4940,6 +5062,7 @@ function NgoDashboard({
   donations,
   requests,
   deliveryTasks,
+  deliveryLocalDay,
   donationCancellations,
   needs,
   onReload,
@@ -4950,12 +5073,14 @@ function NgoDashboard({
   donations: Donation[]
   requests: RequestItem[]
   deliveryTasks: DeliveryTask[]
+  deliveryLocalDay: Date
   donationCancellations: DonationCancellation[]
   needs: CommunityNeed[]
   onReload: () => Promise<void>
   onUserUpdate: (user: SessionUser) => void
 }) {
   const feedbackListLocalDay = new Date()
+  const [deliveriesVisibilityTime, setDeliveriesVisibilityTime] = useState(() => new Date())
   const [message, setMessage] = useState('')
   const [acceptingTaskId, setAcceptingTaskId] = useState<string | null>(null)
   const [issueStatusDrafts, setIssueStatusDrafts] = useState<Record<string, DeliveryIssue['status']>>({})
@@ -4975,6 +5100,13 @@ function NgoDashboard({
   const [requestFeedback, setRequestFeedback] = useState<Record<string, { type: 'success' | 'error'; text: string }>>({})
   const submittingRequestIdsRef = useRef(new Set<string>())
 
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => {
+      setDeliveriesVisibilityTime(new Date())
+    }, Math.max(0, nextKolkataMidnight(deliveriesVisibilityTime) - deliveriesVisibilityTime.getTime()) + 10)
+    return () => window.clearTimeout(timeoutId)
+  }, [deliveriesVisibilityTime])
+
   const [foodRequestForm, setFoodRequestForm] = useState({
     food_name: '',
     category: 'Meals',
@@ -4992,7 +5124,7 @@ function NgoDashboard({
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([])
   const [availableVolunteers, setAvailableVolunteers] = useState<AvailableVolunteer[]>([])
   const [needVolunteerSelections, setNeedVolunteerSelections] = useState<Record<string, string>>({})
-  const [availabilityForm, setAvailabilityForm] = useState({ date: localDateInputValue(), status: 'available' as AvailabilityEntry['status'], notes: '' })
+  const [availabilityForm, setAvailabilityForm] = useState({ date: localDateInputValue(), start_time: '', end_time: '', status: 'available' as AvailabilityEntry['status'], notes: '' })
   const [editingAvailabilityId, setEditingAvailabilityId] = useState<string | null>(null)
   const [availabilityMonth, setAvailabilityMonth] = useState(() => new Date(new Date().getFullYear(), new Date().getMonth(), 1))
   const [selectedAvailabilityDate, setSelectedAvailabilityDate] = useState(localDateInputValue())
@@ -5035,6 +5167,12 @@ function NgoDashboard({
   })
 
   const fetchAvailability = useCallback(() => apiRequest('/volunteer/availability'), [])
+  const availableVolunteersForSchedule = (dateValue?: string, timeValue?: string) => {
+    const schedule = getScheduleWindow(dateValue, timeValue)
+    return availableVolunteers.filter((volunteer) => (
+      volunteerAvailableForWindow(availability, volunteer.id, schedule.date, schedule.time)
+    ))
+  }
   const handleRefreshAvailability = () => {
     setAvailabilityLoading(true)
     setAvailabilityError('')
@@ -5066,6 +5204,10 @@ function NgoDashboard({
 
   const saveAvailability = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
+    if (!availabilityForm.start_time || !availabilityForm.end_time || availabilityForm.end_time <= availabilityForm.start_time) {
+      setMessage('End Time must be later than Start Time.')
+      return
+    }
     setSavingAvailability(true)
     try {
       const response = await apiRequest(
@@ -5084,7 +5226,7 @@ function NgoDashboard({
         return next.sort((left, right) => left.date.localeCompare(right.date))
       })
       setEditingAvailabilityId(null)
-      setAvailabilityForm({ date: localDateInputValue(), status: 'available', notes: '' })
+      setAvailabilityForm({ date: localDateInputValue(), start_time: '', end_time: '', status: 'available', notes: '' })
       setMessage('Availability saved.')
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Unable to save availability')
@@ -5095,7 +5237,7 @@ function NgoDashboard({
 
   const editAvailability = (entry: AvailabilityEntry) => {
     setEditingAvailabilityId(entry.id)
-    setAvailabilityForm({ date: entry.date, status: entry.status, notes: entry.notes || '' })
+    setAvailabilityForm({ date: entry.date, start_time: entry.start_time || '', end_time: entry.end_time || '', status: entry.status, notes: entry.notes || '' })
   }
 
   const deleteAvailability = async (entry: AvailabilityEntry) => {
@@ -5105,7 +5247,7 @@ function NgoDashboard({
       setAvailability((current) => current.filter((item) => item.id !== entry.id))
       if (editingAvailabilityId === entry.id) {
         setEditingAvailabilityId(null)
-        setAvailabilityForm({ date: localDateInputValue(), status: 'available', notes: '' })
+        setAvailabilityForm({ date: localDateInputValue(), start_time: '', end_time: '', status: 'available', notes: '' })
       }
       setMessage('Availability entry deleted.')
     } catch (error) {
@@ -5915,7 +6057,10 @@ function NgoDashboard({
                     const feedback = task.feedback?.find((entry) => (
                       isFeedbackSubmittedOnLocalDay(entry.created_at, feedbackListLocalDay)
                     ))
-                    const issue = task.issues?.[0]
+                    const issue = task.issues?.find((entry) => deliveryIssueMatchesTask(entry, {
+                      id: task.id,
+                      request_id: request.id,
+                    }))
                     return (
                       <div key={task.id} className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-slate-50 p-3">
                         <span className="inline-flex items-center gap-1 text-xs text-slate-600"><Truck size={14} />Delivered · {task.id}</span>
@@ -5995,6 +6140,9 @@ function NgoDashboard({
     const myTasks = deliveryTasks.filter((task) => task.volunteer_id === user.id)
     const activeTasks = myTasks.filter((task) => task.status !== 'delivered' && task.status !== 'cancelled')
     const completedTasks = myTasks.filter((task) => task.status === 'delivered')
+    const todaysMyTasks = [...activeTasks, ...completedTasks].filter((task) => (
+      deliveryTaskIsOnLocalDay(task, deliveryLocalDay)
+    ))
     const cancelledTasks = myTasks.filter((task) => task.status === 'cancelled')
     const completedCount = completedTasks.length
     const badges = [
@@ -6091,9 +6239,9 @@ function NgoDashboard({
         </section>
         <section id="my-deliveries" className="section-shell rounded-[28px] p-5">
           <h2 className="text-2xl font-bold text-slate-900">My deliveries</h2>
-          {[...activeTasks, ...completedTasks].length ? (
+          {todaysMyTasks.length ? (
             <div className="mt-5 space-y-3">
-              {[...activeTasks, ...completedTasks].map((task) => (
+              {todaysMyTasks.map((task) => (
                 <article key={task.id} className="rounded-2xl border border-slate-200 bg-white p-4">
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div className="flex min-w-0 items-center gap-3">
@@ -6147,10 +6295,14 @@ function NgoDashboard({
                       ))}
                     </div>
                   ) : task.status === 'delivered' && <p className="mt-3 text-xs text-slate-500">No feedback has been submitted yet.</p>}
-                  {task.issues?.length ? (
+                  {task.issues?.some((issue) => (
+                    issue.status !== 'resolved' && deliveryIssueMatchesTask(issue, task)
+                  )) ? (
                     <div className="mt-4 border-t border-amber-100 pt-3">
                       <p className="text-xs font-bold uppercase tracking-wide text-amber-900">Delivery issue</p>
-                      {task.issues.map((issue) => (
+                      {task.issues.filter((issue) => (
+                        issue.status !== 'resolved' && deliveryIssueMatchesTask(issue, task)
+                      )).map((issue) => (
                         <div key={issue.id} className="mt-2 rounded-xl bg-amber-50 p-3 text-sm text-amber-950">
                           <p>{issue.description}</p>
                           <p className="mt-1 text-xs font-semibold">Status: {formatStatus(issue.status)} · {new Date(issue.created_at).toLocaleString()}</p>
@@ -6162,7 +6314,7 @@ function NgoDashboard({
                 </article>
               ))}
             </div>
-          ) : <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">You have no active or completed deliveries.</p>}
+          ) : <p className="mt-4 rounded-2xl border border-dashed border-slate-200 p-6 text-sm text-slate-500">You have no deliveries scheduled or completed today.</p>}
         </section>
         {cancelledTasks.length > 0 && (
           <section className="section-shell rounded-[28px] p-5">
@@ -6236,12 +6388,14 @@ function NgoDashboard({
             <div><h2 className="flex items-center gap-2 text-2xl font-bold text-slate-900"><CalendarDays size={21} className="text-[#1d4d3d]" />Availability calendar</h2><p className="mt-1 text-sm text-slate-600">Only you can view and change your availability entries.</p></div>
             <div className="flex items-center gap-2"><button type="button" onClick={() => setAvailabilityMonth(new Date(availabilityMonth.getFullYear(), availabilityMonth.getMonth() - 1, 1))} className="secondary-btn px-3 py-2 text-sm" aria-label="Previous month"><ChevronLeft size={16} /></button><span className="min-w-32 text-center text-sm font-semibold text-slate-800">{availabilityMonth.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}</span><button type="button" onClick={() => setAvailabilityMonth(new Date(availabilityMonth.getFullYear(), availabilityMonth.getMonth() + 1, 1))} className="secondary-btn px-3 py-2 text-sm" aria-label="Next month"><ChevronRight size={16} /></button></div>
           </div>
-          <form onSubmit={saveAvailability} className="mt-4 grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-[1fr_1fr_auto_auto]">
+          <form onSubmit={saveAvailability} className="mt-4 grid gap-3 rounded-2xl bg-slate-50 p-4 sm:grid-cols-2 xl:grid-cols-6">
             <label className="text-sm font-medium text-slate-700">Date<input type="date" value={availabilityForm.date} onChange={(event) => setAvailabilityForm((current) => ({ ...current, date: event.target.value }))} className="input-shell mt-1" required /></label>
+            <label className="text-sm font-medium text-slate-700">Start Time<input type="time" value={availabilityForm.start_time} onChange={(event) => setAvailabilityForm((current) => ({ ...current, start_time: event.target.value }))} className="input-shell mt-1" required /></label>
+            <label className="text-sm font-medium text-slate-700">End Time<input type="time" value={availabilityForm.end_time} onChange={(event) => setAvailabilityForm((current) => ({ ...current, end_time: event.target.value }))} className="input-shell mt-1" required /></label>
             <label className="text-sm font-medium text-slate-700">Status<select value={availabilityForm.status} onChange={(event) => setAvailabilityForm((current) => ({ ...current, status: event.target.value as AvailabilityEntry['status'] }))} className="input-shell mt-1"><option value="available">Available</option><option value="unavailable">Unavailable</option></select></label>
             <button type="submit" disabled={savingAvailability} className="primary-btn inline-flex items-center justify-center gap-2 self-end px-4 py-2 text-sm font-semibold disabled:opacity-60">{savingAvailability ? <LoaderCircle className="animate-spin" size={15} /> : <Save size={15} />}{savingAvailability ? 'Saving…' : 'Save'}</button>
-            {editingAvailabilityId && <button type="button" onClick={() => { setEditingAvailabilityId(null); setAvailabilityForm({ date: localDateInputValue(), status: 'available', notes: '' }) }} className="secondary-btn inline-flex items-center justify-center gap-2 self-end px-4 py-2 text-sm font-semibold"><X size={15} />Cancel</button>}
-            <label className="text-sm font-medium text-slate-700 sm:col-span-4">Notes (optional)<input value={availabilityForm.notes} onChange={(event) => setAvailabilityForm((current) => ({ ...current, notes: event.target.value }))} maxLength={500} className="input-shell mt-1" placeholder="Add any availability details" /></label>
+            {editingAvailabilityId && <button type="button" onClick={() => { setEditingAvailabilityId(null); setAvailabilityForm({ date: localDateInputValue(), start_time: '', end_time: '', status: 'available', notes: '' }) }} className="secondary-btn inline-flex items-center justify-center gap-2 self-end px-4 py-2 text-sm font-semibold"><X size={15} />Cancel</button>}
+            <label className="text-sm font-medium text-slate-700 sm:col-span-2 xl:col-span-6">Notes (optional)<input value={availabilityForm.notes} onChange={(event) => setAvailabilityForm((current) => ({ ...current, notes: event.target.value }))} maxLength={500} className="input-shell mt-1" placeholder="Add any availability details" /></label>
           </form>
           <div className="mt-4 grid grid-cols-7 gap-1 text-center text-xs">
             {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map((day) => <div key={day} className="py-2 font-semibold text-slate-500">{day}</div>)}
@@ -6249,14 +6403,18 @@ function NgoDashboard({
               if (!day) return <div key={`empty-${index}`} className="min-h-16 rounded-lg bg-slate-50/60" />
               const dayDate = `${availabilityMonth.getFullYear()}-${String(availabilityMonth.getMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`
               const entry = availability.find((item) => item.date === dayDate)
-              return <div key={dayDate} className={`min-h-16 rounded-lg border p-1 text-left ${entry?.status === 'available' ? 'border-emerald-200 bg-emerald-50' : entry ? 'border-rose-200 bg-rose-50' : 'border-slate-100 bg-white'}`}><span className="font-semibold text-slate-700">{day}</span>{entry && <div className="mt-1 truncate text-[10px] font-medium">{entry.status === 'available' ? 'Available' : 'Unavailable'}</div>}</div>
+              return <div key={dayDate} className={`min-h-16 rounded-lg border p-1 text-left ${entry?.status === 'available' ? 'border-emerald-200 bg-emerald-50' : entry ? 'border-rose-200 bg-rose-50' : 'border-slate-100 bg-white'}`}><span className="font-semibold text-slate-700">{day}</span>{entry && <><div className="mt-1 truncate text-[10px] font-medium">{entry.status === 'available' ? 'Available' : 'Unavailable'}</div>{entry.start_time && entry.end_time && <div className="truncate text-[10px] text-slate-600">{entry.start_time}–{entry.end_time}</div>}</>}</div>
             })}
           </div>
-          {availability.length > 0 && <div className="mt-4 space-y-2">{availability.map((entry) => <div key={entry.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 p-3"><div><p className="text-sm text-slate-700">{new Date(`${entry.date}T00:00:00`).toLocaleDateString()} · <span className="font-semibold">{entry.status === 'available' ? 'Available' : 'Unavailable'}</span></p>{entry.notes && <p className="mt-1 text-xs text-slate-500">{entry.notes}</p>}</div><div className="flex gap-2"><button type="button" onClick={() => editAvailability(entry)} className="secondary-btn inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold"><Pencil size={13} />Edit</button><button type="button" onClick={() => void deleteAvailability(entry)} className="secondary-btn inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold"><Trash2 size={13} />Delete</button></div></div>)}</div>}
+          {availability.length > 0 && <div className="mt-4 space-y-2">{availability.map((entry) => <div key={entry.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 p-3"><div><p className="text-sm text-slate-700">{new Date(`${entry.date}T00:00:00`).toLocaleDateString()} · <span className="font-semibold">{entry.status === 'available' ? 'Available' : 'Unavailable'}</span></p><p className="mt-1 text-xs text-slate-600">{entry.start_time && entry.end_time ? `${entry.start_time}–${entry.end_time}` : 'Time not specified (legacy entry)'}</p>{entry.notes && <p className="mt-1 text-xs text-slate-500">{entry.notes}</p>}</div><div className="flex gap-2"><button type="button" onClick={() => editAvailability(entry)} className="secondary-btn inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold"><Pencil size={13} />Edit</button><button type="button" onClick={() => void deleteAvailability(entry)} className="secondary-btn inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold"><Trash2 size={13} />Delete</button></div></div>)}</div>}
         </section>
       </div>
     )
   }
+
+  const todaysDeliveryTasks = deliveryTasks.filter((task) => (
+    deliveryTaskIsOnKolkataDay(task, deliveriesVisibilityTime)
+  ))
 
   return (
     <div id="overview" className="space-y-6">
@@ -6326,7 +6484,7 @@ function NgoDashboard({
                   return (
                     <button key={dayDate} type="button" onClick={() => { setSelectedAvailabilityDate(dayDate); setAvailabilityDateFilter('') }} aria-pressed={selectedAvailabilityDate === dayDate} className={`min-h-24 rounded-lg border p-1 text-left ${selectedAvailabilityDate === dayDate ? 'border-[#1d4d3d] ring-2 ring-[#1d4d3d]/20' : 'border-slate-100'} ${hasAvailable && !hasUnavailable ? 'bg-emerald-50' : hasUnavailable && !hasAvailable ? 'bg-rose-50' : hasAvailable && hasUnavailable ? 'bg-amber-50' : 'bg-white'}`}>
                       <span className="font-semibold text-slate-700">{day}</span>
-                      {entriesForDay.slice(0, 2).map((entry) => <span key={entry.id} className="mt-1 block truncate text-left text-[10px] text-slate-600">{entry.volunteer_name}: {entry.status === 'available' ? 'Available' : 'Unavailable'}</span>)}
+                      {entriesForDay.slice(0, 2).map((entry) => <span key={entry.id} className="mt-1 block truncate text-left text-[10px] text-slate-600">{entry.volunteer_name}: {entry.status === 'available' ? 'Available' : 'Unavailable'}{entry.start_time && entry.end_time ? ` ${entry.start_time}–${entry.end_time}` : ''}</span>)}
                       {entriesForDay.length > 2 && <span className="mt-1 block text-[10px] font-semibold text-slate-500">+{entriesForDay.length - 2} more</span>}
                     </button>
                   )
@@ -6346,6 +6504,7 @@ function NgoDashboard({
                           <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${entry.status === 'available' ? 'bg-emerald-50 text-emerald-800' : 'bg-rose-50 text-rose-800'}`}>{entry.status === 'available' ? 'Available' : 'Unavailable'}</span>
                         </div>
                         <p className="mt-1 text-xs text-slate-500">{entry.date} · Volunteer ID: {entry.volunteer_id}</p>
+                        <p className="mt-1 text-xs text-slate-600">{entry.start_time && entry.end_time ? `${entry.start_time}–${entry.end_time}` : 'Time not specified (legacy entry)'}</p>
                         {entry.notes && <p className="mt-2 text-sm text-slate-600">{entry.notes}</p>}
                       </article>
                     ))}
@@ -6458,10 +6617,10 @@ function NgoDashboard({
                                 Assign volunteer
                                 <select value={needVolunteerSelections[contribution.id] || ''} onChange={(event) => setNeedVolunteerSelections((current) => ({ ...current, [contribution.id]: event.target.value }))} className="input-shell mt-1">
                                   <option value="">Select volunteer</option>
-                                  {availableVolunteers.map((volunteer) => <option key={volunteer.id} value={volunteer.id}>{volunteer.full_name}{volunteer.city ? ` · ${volunteer.city}` : ''}</option>)}
+                                  {availableVolunteersForSchedule(request.required_date, request.required_time).map((volunteer) => <option key={volunteer.id} value={volunteer.id}>{volunteer.full_name}{volunteer.city ? ` · ${volunteer.city}` : ''}</option>)}
                                 </select>
                               </label>
-                              <button type="button" onClick={() => void assignRequestContribution(request, contribution)} disabled={!availableVolunteers.length || !needVolunteerSelections[contribution.id] || !contribution.pickup_location} className="primary-btn inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold disabled:opacity-50"><Truck size={14} />Assign delivery</button>
+                              <button type="button" onClick={() => void assignRequestContribution(request, contribution)} disabled={!availableVolunteersForSchedule(request.required_date, request.required_time).length || !needVolunteerSelections[contribution.id] || !contribution.pickup_location} className="primary-btn inline-flex items-center gap-1 px-3 py-2 text-xs font-semibold disabled:opacity-50"><Truck size={14} />Assign delivery</button>
                             </div>
                           )}
                         </div>
@@ -6517,7 +6676,7 @@ function NgoDashboard({
         </form>
         {message && <p className="mt-3 text-sm text-[#1d4d3d]" role="status">{message}</p>}
         <div className="mt-5 space-y-3">
-          {deliveryTasks.map((task) => (
+          {todaysDeliveryTasks.map((task) => (
             <article key={task.id} className="rounded-2xl border border-slate-200 bg-white p-4">
               <div className="flex flex-wrap justify-between gap-2">
                 <div>
@@ -6531,7 +6690,7 @@ function NgoDashboard({
               </div>
             </article>
           ))}
-          {!deliveryTasks.length && <p className="text-sm text-slate-500">No delivery tasks have been created.</p>}
+          {!todaysDeliveryTasks.length && <p className="text-sm text-slate-500">No deliveries are scheduled for today.</p>}
         </div>
       </section>
 
@@ -6539,7 +6698,10 @@ function NgoDashboard({
         <h2 className="flex items-center gap-2 text-2xl font-bold text-slate-900"><ClipboardList size={22} className="text-[#1d4d3d]" />Delivery Feedback &amp; Issues</h2>
         {deliveryTasks.some((task) => (
           task.feedback?.some((feedback) => isFeedbackSubmittedOnLocalDay(feedback.created_at, feedbackListLocalDay))
-          || task.issues?.some((issue) => isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay))
+          || task.issues?.some((issue) => (
+            deliveryIssueMatchesTask(issue, task)
+            && isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay)
+          ))
         )) ? (
           <div className="mt-4 space-y-3">
             {deliveryTasks.flatMap((task) => (
@@ -6573,7 +6735,10 @@ function NgoDashboard({
             ))}
             {deliveryTasks.flatMap((task) => (
               (task.issues || [])
-                .filter((issue) => isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay))
+                .filter((issue) => (
+                  deliveryIssueMatchesTask(issue, task)
+                  && isFeedbackSubmittedOnLocalDay(issue.created_at, feedbackListLocalDay)
+                ))
                 .map((issue) => {
                   const actionTaken = issueActionDrafts[issue.id]
                     || (issue.action_taken === true ? 'yes' : issue.action_taken === false ? 'no' : '')
@@ -6800,7 +6965,7 @@ function NgoDashboard({
                                 className="input-shell mt-1"
                               >
                                 <option value="">Select volunteer</option>
-                                {availableVolunteers.map((volunteer) => (
+                                {availableVolunteersForSchedule(need.required_date).map((volunteer) => (
                                   <option key={volunteer.id} value={volunteer.id}>
                                     {volunteer.full_name}{volunteer.city ? ` · ${volunteer.city}` : ''}
                                   </option>
@@ -6810,12 +6975,12 @@ function NgoDashboard({
                             <button
                               type="button"
                               onClick={() => void assignNeedDelivery(need, contribution)}
-                              disabled={!availableVolunteers.length || !needVolunteerSelections[contribution.id] || !contribution.pickup_location}
+                              disabled={!availableVolunteersForSchedule(need.required_date).length || !needVolunteerSelections[contribution.id] || !contribution.pickup_location}
                               className="primary-btn px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               Assign delivery
                             </button>
-                            {!availableVolunteers.length && <p className="w-full text-xs text-slate-500">No available volunteers at this time.</p>}
+                            {!availableVolunteersForSchedule(need.required_date).length && <p className="w-full text-xs text-slate-500">No available volunteers during this need’s scheduled window.</p>}
                             {!contribution.pickup_location && <p className="w-full text-xs text-amber-700">The donor must save a pickup location before assignment.</p>}
                           </div>
                         )}
